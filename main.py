@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
 from pydantic import BaseModel
+
+from google import genai  # google-genai SDK  :contentReference[oaicite:4]{index=4}
 
 # Load .env once at startup (local dev)
 load_dotenv()
@@ -17,19 +18,16 @@ app = FastAPI(title="Task Updater API", version="1.0.0")
 # CORS (tighten allow_origins in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # TODO: restrict in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Groq client (server-side only)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    # Don't crash here; we'll raise a clear error on request.
-    client = None
-else:
-    client = Groq(api_key=GROQ_API_KEY)
+# Gemini API key handling:
+# SDK auto-picks up GEMINI_API_KEY or GOOGLE_API_KEY from env :contentReference[oaicite:5]{index=5}
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+client = genai.Client() if GEMINI_API_KEY else None
 
 
 # ----------- Request schema -----------
@@ -39,25 +37,21 @@ class UpdateReq(BaseModel):
     tasks: list
 
 
-# ----------- Structured output schema -----------
+# ----------- Structured output schema (Gemini expects pure JSON schema) -----------
 
-TASKS_SCHEMA = {
-    "name": "tasks_array",
-    "strict": True,
-    "schema": {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "Title": {"type": "string", "minLength": 1},
-                "deadline": {"type": ["string", "null"]},
-                "effort": {"type": ["integer", "null"], "minimum": 1},
-                "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
-                "additional details": {"type": "string"},
-            },
-            "required": ["Title", "deadline", "effort", "priority", "additional details"],
+TASKS_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "Title": {"type": "string", "minLength": 1},
+            "deadline": {"type": ["string", "null"]},
+            "effort": {"type": ["integer", "null"], "minimum": 1},
+            "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
+            "additional details": {"type": "string"},
         },
+        "required": ["Title", "deadline", "effort", "priority", "additional details"],
     },
 }
 
@@ -72,7 +66,8 @@ Output:
 Return the COMPLETE, UPDATED JSON array of tasks.
 
 Rules:
-1) PRESERVE STATE: The output array MUST include ALL tasks from 'existing_tasks' that were not modified, PLUS any new or updated tasks. Do not drop existing tasks unless the user explicitly asks to delete them.
+1) PRESERVE STATE: The output array MUST include ALL tasks from 'existing_tasks' that were not modified,
+   PLUS any new or updated tasks. Do not drop existing tasks unless the user explicitly asks to delete them.
 2) Split multiple tasks into separate entries.
 3) If the user edits an existing task, update it by matching Title (case-insensitive).
    If ambiguous, choose the closest match and mention ambiguity in "additional details".
@@ -99,9 +94,6 @@ CRITICAL OUTPUT RULES:
   - If priorities differ, choose the higher urgency: High > Medium > Low.
 """.strip()
 
-
-# ----------- Post-processing helpers -----------
-
 PRIORITY_RANK = {"High": 3, "Medium": 2, "Low": 1}
 
 
@@ -120,7 +112,7 @@ def _flatten_list(x: Any) -> List[Any]:
 
 
 def _coerce_task_keys(t: Dict[str, Any]) -> Dict[str, Any]:
-    # Helps JSON-mode fallback where keys sometimes differ
+    # If the model ever returns different keys, normalize them here
     key_map = {
         "title": "Title",
         "Title": "Title",
@@ -221,9 +213,6 @@ def _best_title_match(fragment: str, titles: List[str]) -> Union[str, None]:
 
 
 def patch_dependencies(tasks: List[Dict[str, Any]], user_input: str) -> List[Dict[str, Any]]:
-    """
-    Safety-net dependency patcher for 'A after B' / 'depends on B' phrasing.
-    """
     titles = [t["Title"] for t in tasks if t.get("Title")]
 
     segments = re.split(r"[.\n;]+", user_input)
@@ -252,78 +241,76 @@ def patch_dependencies(tasks: List[Dict[str, Any]], user_input: str) -> List[Dic
     return tasks
 
 
-# ----------- Groq calls -----------
+# ----------- Gemini call -----------
 
-def groq_update(existing_tasks, user_input) -> str:
+def gemini_update(existing_tasks, user_input) -> str:
+    """
+    Uses Gemini structured outputs:
+    config.response_mime_type = application/json
+    config.response_json_schema = <JSON schema>
+    :contentReference[oaicite:6]{index=6}
+    """
     if client is None:
-        raise RuntimeError("GROQ_API_KEY not configured")
+        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY not configured")
 
-    resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "existing_tasks:\n"
-                    f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
-                    "user_input:\n"
-                    f"{user_input}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": TASKS_SCHEMA},
-        temperature=0.2,
-        max_tokens=1200,
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        "existing_tasks:\n"
+        f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
+        "user_input:\n"
+        f"{user_input}"
     )
-    return resp.choices[0].message.content
+
+    resp = client.models.generate_content(
+        model="gemini-3-flash-preview",
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": TASKS_JSON_SCHEMA,
+        },
+    )
+    return resp.text
 
 
-def groq_update_fallback_json_mode(existing_tasks, user_input) -> str:
+def gemini_update_fallback(existing_tasks, user_input) -> str:
+    """
+    Fallback: still request JSON mime type, but no schema.
+    """
     if client is None:
-        raise RuntimeError("GROQ_API_KEY not configured")
+        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY not configured")
 
-    resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT + "\nReturn valid JSON only."},
-            {
-                "role": "user",
-                "content": (
-                    "existing_tasks:\n"
-                    f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
-                    "user_input:\n"
-                    f"{user_input}"
-                ),
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        max_tokens=1200,
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        "Return valid JSON only.\n\n"
+        "existing_tasks:\n"
+        f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
+        "user_input:\n"
+        f"{user_input}"
     )
-    return resp.choices[0].message.content
+
+    resp = client.models.generate_content(
+        model="gemini-3-flash-preview",
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+    return resp.text
 
 
 # ----------- Routes -----------
 
 @app.get("/health")
 def health():
-    return {"ok": True, "has_key": bool(GROQ_API_KEY)}
+    return {"ok": True, "has_key": bool(GEMINI_API_KEY)}
 
 
 @app.post("/tasks/update")
 def update_tasks(req: UpdateReq):
-    """
-    POST /tasks/update
-    Body: { "user_input": "...", "tasks": [...] }
-    Returns: { "tasks": [...] }
-    """
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=500, detail="Server misconfigured: GROQ_API_KEY missing")
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: GEMINI_API_KEY/GOOGLE_API_KEY missing")
 
     # 1) Structured outputs path
     try:
-        raw = groq_update(req.tasks, req.user_input)
+        raw = gemini_update(req.tasks, req.user_input)
         parsed = json.loads(raw)
         updated = clean_and_dedupe(parsed)
         updated = patch_dependencies(updated, req.user_input)
@@ -332,12 +319,12 @@ def update_tasks(req: UpdateReq):
     except Exception:
         pass
 
-    # 2) Fallback: JSON mode (less strict)
+    # 2) Fallback path
     try:
-        raw = groq_update_fallback_json_mode(req.tasks, req.user_input)
+        raw = gemini_update_fallback(req.tasks, req.user_input)
         parsed = json.loads(raw)
 
-        # Some models may wrap: {"tasks":[...]}
+        # In case model wraps unexpectedly
         if isinstance(parsed, dict) and "tasks" in parsed:
             parsed = parsed["tasks"]
 
