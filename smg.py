@@ -54,7 +54,7 @@ class ScheduleResponse(BaseModel):
 
 # -------------------- App --------------------
 
-app = APIRouter()
+router = APIRouter()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
