@@ -75,7 +75,12 @@ Rules:
 1) PRESERVE STATE INSIDE THIS SUBSET:
    - Return ALL tasks you received in existing_tasks unless the directive explicitly deletes them.
    - Apply edits to matching tasks in this subset.
-   - Add new tasks if the directive adds them.
+   Relative date edits:
+    - If the directive says move/change a task "to after a week" / "in a week" / "next week":
+    - If the task already has a deadline, shift that deadline forward by 7 days (preserve the time component).
+    - If the task has no deadline, set deadline = now + 7 days. If no time is implied, use 09:00 local time.
+    - Similarly handle "after X days/weeks/months" by shifting the existing deadline when present; otherwise schedule relative to now.
+
 2) Split multiple tasks in the directive into separate entries.
 3) Editing:
    - If the directive changes an existing task, match by Title (case-insensitive) and modify those contents.
@@ -96,7 +101,7 @@ Rules:
    - If missing, null.
 7) priority:
    - If not given, infer: urgent deadlines -> High, otherwise Medium; trivial -> Low.
-8) Be aware of today's date and time which is{now}. So, if only time is mentioned, the event should be scheduled for anytime after right now.
+8) Be aware of today's date and time which is {now}. So, if only time is mentioned, the event should be scheduled for anytime after right now.
 CRITICAL OUTPUT RULES:
 - Output MUST be a single JSON array of task objects. No nesting. No extra wrapper keys.
 - Never output empty objects {{}}.
