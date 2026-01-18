@@ -92,8 +92,9 @@ Rules:
    - Put dependencies in a separate field "dependencies" as an array of Titles.
    - Example:
      directive: "Email mentor after Finish PPT"
-     => Email mentor.dependencies MUST include ["Finish PPT"]
+     => Email mentor.dependencies MUST include ["Finish PPT"] after creating the task Finish PPT if it is not there. 
    - Do NOT write dependency info as "Depends on: ..." inside "additional details".
+   - So, overall, the dependencies of all tasks should be existing task titles.
 5) deadline:
    - If only a date is mentioned, use YYYY-MM-DD.
    - If time is mentioned, use ISO 8601 string (include timezone if available).
