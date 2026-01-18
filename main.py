@@ -96,7 +96,7 @@ Rules:
    - Do NOT write dependency info as "Depends on: ..." inside "additional details".
    - So, overall, the dependencies of all tasks should be existing task titles.
 4.5) If a time is mentioned at which task has to be completed, mention it in additional Details as "Time:....."(in ISO 8601 string)
-5) deadline(mention only date in this):
+5) deadline(mention only date in this and time keep as 11:59 pm strictly no matter what):
    - If only a date is mentioned, use YYYY-MM-DD.
    - If missing, null.
 6) effort:
