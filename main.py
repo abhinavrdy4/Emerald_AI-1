@@ -34,7 +34,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 client = genai.Client() if GEMINI_API_KEY else None
 
 # Choose a fast model for extraction. Change if needed.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3-pro-preview"
 
 # -------------------- API Contracts --------------------
 
