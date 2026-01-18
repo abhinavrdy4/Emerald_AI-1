@@ -1,16 +1,18 @@
+# smg.py
 import os
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, date, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, APIRouter
+from fastapi import HTTPException, APIRouter
 from pydantic import BaseModel, Field
 from zoneinfo import ZoneInfo
 from dateutil import parser as dtparser
 
-from google import genai  # google-genai
+from google import genai  # pip install google-genai
 
 load_dotenv()
 
@@ -21,25 +23,22 @@ TZ_DEFAULT = ZoneInfo(TZ_NAME_DEFAULT)
 
 class TaskIn(BaseModel):
     Title: str
-    dependency: Optional[str] = None  # you said this may exist; we’ll also infer from "additional details"
-    deadline: Optional[str] = None    # ISO string or null
-    effort: Optional[int] = None      # minutes or null
-    priority: str = "Medium"          # High/Medium/Low
+    dependency: Optional[str] = None
+    deadline: Optional[str] = None
+    effort: Optional[int] = None
+    priority: str = "Medium"
     additional_details: str = Field(default="", alias="additional details")
 
 class ScheduleRequest(BaseModel):
     tasks: List[TaskIn]
     existing_events: List[Dict[str, Any]] = Field(default_factory=list)
 
-    # Optional constraints (sane defaults for hackathon)
     timezone: str = TZ_NAME_DEFAULT
-    work_start: str = "09:00"      # local time
-    work_end: str = "18:00"        # local time
+    work_start: str = "09:00"
+    work_end: str = "18:00"
     lunch_start: str = "13:00"
     lunch_end: str = "14:00"
     break_minutes: int = 10
-
-    # Optional: start scheduling from this datetime; else “now”
     schedule_from: Optional[str] = None
 
 class EventOut(BaseModel):
@@ -52,7 +51,7 @@ class ScheduleResponse(BaseModel):
     events_to_create: List[EventOut]
     reasoning: str
 
-# -------------------- App --------------------
+# -------------------- Router --------------------
 
 router = APIRouter()
 
@@ -62,7 +61,6 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 # -------------------- Helpers: parsing --------------------
 
 def parse_dt(s: str, tz: ZoneInfo) -> datetime:
-    """Parse an ISO-ish datetime string into timezone-aware datetime."""
     dt = dtparser.parse(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz)
@@ -102,7 +100,6 @@ def intersects(a: Interval, b: Interval) -> bool:
     return a.start < b.end and b.start < a.end
 
 def subtract_busy(free: Interval, busy: Interval) -> List[Interval]:
-    """Return free pieces after removing busy overlap."""
     if not intersects(free, busy):
         return [free]
     pieces = []
@@ -131,8 +128,7 @@ def events_to_busy(existing_events: List[Dict[str, Any]], tz: ZoneInfo) -> List[
         # All-day event (date -> date)
         if "date" in start and "date" in end:
             d0 = parse_date_only(start["date"])
-            d1 = parse_date_only(end["date"])  # end date is exclusive in Google Calendar
-            # Block whole days from 00:00 to 23:59:59
+            d1 = parse_date_only(end["date"])  # end is exclusive
             cur = d0
             while cur < d1:
                 s = datetime.combine(cur, time(0, 0), tzinfo=tz)
@@ -147,21 +143,17 @@ def events_to_busy(existing_events: List[Dict[str, Any]], tz: ZoneInfo) -> List[
 
 def day_windows(day: date, tz: ZoneInfo, work_start: time, work_end: time,
                 lunch_start: time, lunch_end: time) -> List[Interval]:
-    """Return allowed working windows excluding lunch."""
     ws = datetime.combine(day, work_start, tzinfo=tz)
     we = datetime.combine(day, work_end, tzinfo=tz)
     ls = datetime.combine(day, lunch_start, tzinfo=tz)
     le = datetime.combine(day, lunch_end, tzinfo=tz)
 
     windows = []
-    # before lunch
     if ls > ws:
         windows.append(Interval(ws, min(ls, we)))
-    # after lunch
     if we > le:
         windows.append(Interval(max(le, ws), we))
 
-    # Filter invalid
     return [w for w in windows if w.end > w.start]
 
 # -------------------- Task ordering (dependencies + urgency) --------------------
@@ -172,7 +164,7 @@ def infer_dependencies(task: TaskIn) -> List[str]:
     deps = []
     if task.dependency:
         deps.append(task.dependency.strip())
-    # Also parse "Depends on: X, Y" if present
+
     ad = task.additional_details or ""
     if "Depends on:" in ad:
         part = ad.split("Depends on:", 1)[1]
@@ -183,7 +175,6 @@ def infer_dependencies(task: TaskIn) -> List[str]:
     return deps
 
 def topo_order(tasks: List[TaskIn]) -> List[TaskIn]:
-    # Key by normalized title
     def norm(s: str) -> str:
         return " ".join(s.lower().split())
 
@@ -198,8 +189,7 @@ def topo_order(tasks: List[TaskIn]) -> List[TaskIn]:
         if n in perm:
             return
         if n in temp:
-            # cycle -> ignore cycle by treating as no further constraints
-            return
+            return  # cycle -> ignore
         temp.add(n)
         for d in deps_map.get(n, []):
             if d in by_key:
@@ -213,7 +203,6 @@ def topo_order(tasks: List[TaskIn]) -> List[TaskIn]:
 
     ordered = [by_key[k] for k in out_keys if k in by_key]
 
-    # Secondary sort inside topo by deadline/priority (stable)
     def deadline_key(t: TaskIn):
         if t.deadline:
             try:
@@ -225,7 +214,165 @@ def topo_order(tasks: List[TaskIn]) -> List[TaskIn]:
     ordered.sort(key=lambda t: (deadline_key(t), -PRIORITY_RANK.get(t.priority, 2)))
     return ordered
 
-# -------------------- Slot finding --------------------
+# -------------------- Preferred time extraction --------------------
+
+def extract_preferred_time_hint(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Supported patterns inside additional details:
+    - Preferred time: YYYY-MM-DD HH:MM
+    - Preferred time: HH:MM
+    - Preferred window: HH:MM-HH:MM
+    - casual: "at 6am", "at 6 pm", "at 18:00"
+    Returns dict or None.
+    """
+    if not text:
+        return None
+    s = text.strip()
+
+    m = re.search(r"preferred\s*time\s*:\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})", s, re.IGNORECASE)
+    if m:
+        d = dtparser.parse(m.group(1)).date()
+        tod = parse_hhmm(m.group(2))
+        return {"type": "exact_date_time", "date": d, "time": tod}
+
+    m = re.search(r"preferred\s*time\s*:\s*(\d{1,2}:\d{2})", s, re.IGNORECASE)
+    if m:
+        return {"type": "time_of_day", "time": parse_hhmm(m.group(1))}
+
+    m = re.search(r"preferred\s*window\s*:\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", s, re.IGNORECASE)
+    if m:
+        return {"type": "window", "start": parse_hhmm(m.group(1)), "end": parse_hhmm(m.group(2))}
+
+    m = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", s, re.IGNORECASE)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2) or "0")
+        ap = (m.group(3) or "").lower()
+        if ap == "pm" and hh != 12:
+            hh += 12
+        if ap == "am" and hh == 12:
+            hh = 0
+        hh = hh % 24
+        return {"type": "time_of_day", "time": time(hh, mm)}
+
+    return None
+
+def build_preferred_windows(
+    hint: Dict[str, Any],
+    start_from: datetime,
+    deadline: Optional[datetime],
+    tz: ZoneInfo,
+    work_start_t: time,
+    work_end_t: time,
+    lunch_start_t: time,
+    lunch_end_t: time,
+) -> List[Interval]:
+    windows: List[Interval] = []
+
+    def clamp_to_work(day: date, raw_start: datetime, raw_end: datetime) -> List[Interval]:
+        allowed = day_windows(day, tz, work_start_t, work_end_t, lunch_start_t, lunch_end_t)
+        out = []
+        for a in allowed:
+            s = max(raw_start, a.start)
+            e = min(raw_end, a.end)
+            if e > s:
+                out.append(Interval(s, e))
+        return out
+
+    def apply_deadline(ws: List[Interval]) -> List[Interval]:
+        if not deadline:
+            return ws
+        out = []
+        for w in ws:
+            if w.start >= deadline:
+                continue
+            e = min(w.end, deadline)
+            if e > w.start:
+                out.append(Interval(w.start, e))
+        return out
+
+    if hint["type"] == "exact_date_time":
+        d = hint["date"]
+        tod = hint["time"]
+        s = datetime.combine(d, tod, tzinfo=tz)
+        e = s + timedelta(hours=4)
+        if e <= start_from:
+            return []
+        return apply_deadline(clamp_to_work(d, s, e))
+
+    if hint["type"] == "time_of_day":
+        tod = hint["time"]
+        horizon_days = 7
+        if deadline:
+            horizon_days = min(horizon_days, max(1, (deadline.date() - start_from.date()).days + 1))
+        for i in range(horizon_days):
+            d = start_from.date() + timedelta(days=i)
+            s = datetime.combine(d, tod, tzinfo=tz)
+            e = s + timedelta(hours=4)
+            if e <= start_from:
+                continue
+            windows.extend(clamp_to_work(d, s, e))
+        return apply_deadline(windows)
+
+    if hint["type"] == "window":
+        wstart = hint["start"]
+        wend = hint["end"]
+        if wend <= wstart:
+            return []
+        horizon_days = 7
+        if deadline:
+            horizon_days = min(horizon_days, max(1, (deadline.date() - start_from.date()).days + 1))
+        for i in range(horizon_days):
+            d = start_from.date() + timedelta(days=i)
+            s = datetime.combine(d, wstart, tzinfo=tz)
+            e = datetime.combine(d, wend, tzinfo=tz)
+            if e <= start_from:
+                continue
+            windows.extend(clamp_to_work(d, s, e))
+        return apply_deadline(windows)
+
+    return []
+
+def find_slot_in_windows(
+    duration_min: int,
+    windows: List[Interval],
+    start_from: datetime,
+    deadline: Optional[datetime],
+    busy: List[Interval],
+) -> Optional[Interval]:
+    dur = timedelta(minutes=duration_min)
+
+    for w in windows:
+        w0 = w
+        if w0.end <= start_from:
+            continue
+        if w0.start < start_from:
+            w0 = Interval(start_from, w0.end)
+
+        if deadline:
+            if w0.start >= deadline:
+                continue
+            w0 = Interval(w0.start, min(w0.end, deadline))
+
+        if w0.end - w0.start < dur:
+            continue
+
+        free_parts = [w0]
+        for b in busy:
+            new_parts = []
+            for fp in free_parts:
+                new_parts.extend(subtract_busy(fp, b))
+            free_parts = new_parts
+            if not free_parts:
+                break
+
+        for fp in free_parts:
+            if fp.end - fp.start >= dur:
+                return Interval(fp.start, fp.start + dur)
+
+    return None
+
+# -------------------- Slot finding (fallback) --------------------
 
 def find_earliest_slot(
     duration_min: int,
@@ -238,13 +385,8 @@ def find_earliest_slot(
     lunch_start_t: time,
     lunch_end_t: time,
 ) -> Optional[Interval]:
-    """
-    Find earliest slot of given duration after start_from and before deadline (if provided).
-    Uses work windows and subtracts busy intervals.
-    """
     dur = timedelta(minutes=duration_min)
 
-    # search horizon: until deadline day+1 or next 14 days
     if deadline:
         last_day = deadline.date()
         horizon_days = max(1, min(14, (last_day - start_from.date()).days + 1))
@@ -256,15 +398,14 @@ def find_earliest_slot(
     for i in range(horizon_days):
         day = cur_day + timedelta(days=i)
         windows = day_windows(day, tz, work_start_t, work_end_t, lunch_start_t, lunch_end_t)
+
         for w in windows:
-            # clamp start to start_from
             w0 = w
             if w0.end <= start_from:
                 continue
             if w0.start < start_from:
                 w0 = Interval(start_from, w0.end)
 
-            # if deadline exists, clamp end
             if deadline and w0.start >= deadline:
                 return None
             if deadline and w0.end > deadline:
@@ -273,12 +414,8 @@ def find_earliest_slot(
             if w0.end - w0.start < dur:
                 continue
 
-            # subtract busy intervals
             free_parts = [w0]
             for b in busy:
-                # quick skip
-                if b.end <= free_parts[0].start:
-                    continue
                 new_parts = []
                 for fp in free_parts:
                     new_parts.extend(subtract_busy(fp, b))
@@ -286,7 +423,6 @@ def find_earliest_slot(
                 if not free_parts:
                     break
 
-            # choose earliest fitting
             for fp in free_parts:
                 if fp.end - fp.start >= dur:
                     return Interval(fp.start, fp.start + dur)
@@ -325,31 +461,51 @@ def schedule_tasks(
     current_pointer = start_from
 
     for t in ordered:
-        effort = t.effort if (isinstance(t.effort, int) and t.effort > 0) else 30  # default 30 min if missing
+        effort = t.effort if (isinstance(t.effort, int) and t.effort > 0) else 30
         deadline_dt = parse_dt(t.deadline, tz) if t.deadline else None
 
-        # Ensure break before this task (except first) by moving pointer forward
+        # break before each task except first
         if planned_events:
             current_pointer = current_pointer + timedelta(minutes=break_minutes)
 
-        slot = find_earliest_slot(
-            duration_min=effort,
-            start_from=current_pointer,
-            deadline=deadline_dt,
-            busy=busy,
-            tz=tz,
-            work_start_t=work_start_t,
-            work_end_t=work_end_t,
-            lunch_start_t=lunch_start_t,
-            lunch_end_t=lunch_end_t,
-        )
+        # --- Try preferred time/window first ---
+        slot = None
+        hint = extract_preferred_time_hint(t.additional_details or "")
+        preferred_windows: List[Interval] = []
+        if hint:
+            preferred_windows = build_preferred_windows(
+                hint=hint,
+                start_from=current_pointer,
+                deadline=deadline_dt,
+                tz=tz,
+                work_start_t=work_start_t,
+                work_end_t=work_end_t,
+                lunch_start_t=lunch_start_t,
+                lunch_end_t=lunch_end_t,
+            )
 
+        if preferred_windows:
+            slot = find_slot_in_windows(
+                duration_min=effort,
+                windows=preferred_windows,
+                start_from=current_pointer,
+                deadline=deadline_dt,
+                busy=busy,
+            )
+            if slot:
+                decisions.append({
+                    "task": t.Title,
+                    "note": "Scheduled near preferred time from additional details (no conflicts).",
+                    "scheduled_start": slot.start.isoformat(),
+                    "scheduled_end": slot.end.isoformat(),
+                })
+
+        # --- Fallback to earliest available (respect deadline if present) ---
         if slot is None:
-            # Couldn't fit within horizon/deadline; schedule at next available ignoring deadline constraint
             slot = find_earliest_slot(
                 duration_min=effort,
                 start_from=current_pointer,
-                deadline=None,
+                deadline=deadline_dt,
                 busy=busy,
                 tz=tz,
                 work_start_t=work_start_t,
@@ -357,24 +513,37 @@ def schedule_tasks(
                 lunch_start_t=lunch_start_t,
                 lunch_end_t=lunch_end_t,
             )
+
             if slot is None:
-                raise RuntimeError(f"Could not find any free slot for task: {t.Title}")
+                slot = find_earliest_slot(
+                    duration_min=effort,
+                    start_from=current_pointer,
+                    deadline=None,
+                    busy=busy,
+                    tz=tz,
+                    work_start_t=work_start_t,
+                    work_end_t=work_end_t,
+                    lunch_start_t=lunch_start_t,
+                    lunch_end_t=lunch_end_t,
+                )
+                if slot is None:
+                    raise RuntimeError(f"Could not find any free slot for task: {t.Title}")
 
-            decisions.append({
-                "task": t.Title,
-                "note": "Deadline could not be satisfied; scheduled at next available slot.",
-                "scheduled_start": slot.start.isoformat(),
-                "scheduled_end": slot.end.isoformat(),
-            })
-        else:
-            decisions.append({
-                "task": t.Title,
-                "note": "Scheduled at earliest available slot respecting work hours, lunch, and conflicts.",
-                "scheduled_start": slot.start.isoformat(),
-                "scheduled_end": slot.end.isoformat(),
-            })
+                decisions.append({
+                    "task": t.Title,
+                    "note": "Deadline could not be satisfied; scheduled at next available slot.",
+                    "scheduled_start": slot.start.isoformat(),
+                    "scheduled_end": slot.end.isoformat(),
+                })
+            else:
+                decisions.append({
+                    "task": t.Title,
+                    "note": "Scheduled at earliest available slot respecting work hours, lunch, and conflicts.",
+                    "scheduled_start": slot.start.isoformat(),
+                    "scheduled_end": slot.end.isoformat(),
+                })
 
-        # Add this scheduled interval to busy so later tasks don’t overlap
+        # reserve the slot
         busy = merge_intervals(busy + [slot])
 
         description = f"Priority: {t.priority}\n{t.additional_details or ''}".strip()
@@ -393,35 +562,32 @@ def schedule_tasks(
 # -------------------- Gemini reasoning (explanation only) --------------------
 
 def gemini_explain(tasks: List[TaskIn], decisions: List[Dict[str, Any]], tz_name: str) -> str:
-    """
-    Gemini writes a clear explanation based on the deterministic schedule decisions.
-    """
     if gemini_client is None:
-        # fallback explanation if no key
-        lines = ["Scheduled tasks in earliest available slots without conflicts, respecting breaks/lunch."]
+        lines = ["Scheduled tasks without conflicts, respecting work hours, lunch, breaks, and deadlines when possible."]
         for d in decisions:
             lines.append(f"- {d['task']}: {d['note']} ({d['scheduled_start']} → {d['scheduled_end']})")
         return "\n".join(lines)
 
-    prompt = {
+    payload = {
         "timezone": tz_name,
         "tasks": [t.model_dump(by_alias=True) for t in tasks],
-        "decisions": decisions
+        "decisions": decisions,
     }
 
     resp = gemini_client.models.generate_content(
-        model="gemini-3-pro-preview",
+        model="gemini-1.5-flash",
         contents=(
             "Explain scheduling decisions clearly for the user.\n"
+            "Mention when you honored preferred times from additional details.\n"
             "Constraints: no overlaps with existing events, breaks between tasks, respect deadlines and priorities when possible.\n"
             "If any deadline could not be met, explain why and what was done.\n"
             "Write a concise but clear explanation.\n\n"
-            f"DATA:\n{json.dumps(prompt, indent=2)}"
+            f"DATA:\n{json.dumps(payload, indent=2)}"
         ),
     )
     return (resp.text or "").strip()
 
-# -------------------- Endpoint --------------------
+# -------------------- Endpoints --------------------
 
 @router.post("/schedule/plan", response_model=ScheduleResponse)
 def plan_schedule(req: ScheduleRequest):
@@ -439,7 +605,6 @@ def plan_schedule(req: ScheduleRequest):
         )
         reasoning = gemini_explain(req.tasks, decisions, req.timezone)
         return ScheduleResponse(events_to_create=planned_events, reasoning=reasoning)
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

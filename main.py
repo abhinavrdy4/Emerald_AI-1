@@ -97,7 +97,7 @@ Rules:
    - So, overall, the dependencies of all tasks should be existing task titles.
 5) deadline:
    - If only a date is mentioned, use YYYY-MM-DD.
-   - If time is mentioned, use ISO 8601 string (include timezone if available).
+   - If time is mentioned for deadline specifiacaly, use ISO 8601 string (include timezone if available).Else if mentioned in general, put in additional details as Time: <time in ISO 8601 string (include timezone if available)
    - If missing, null.
 6) effort:
    - Convert hours/minutes to integer minutes (e.g., 1.5h -> 90).
