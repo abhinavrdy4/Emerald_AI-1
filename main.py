@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from google import genai  # pip install google-genai
-
+from smg import router as smg_router
 # -------------------- Startup --------------------
 from datetime import datetime
 
@@ -20,7 +20,7 @@ now = datetime.now()
 load_dotenv()
 
 app = FastAPI(title="Task Updater API (Gemini)", version="2.0.0")
-
+app.include_router(smg_router)
 # CORS (tighten in production)
 app.add_middleware(
     CORSMiddleware,
