@@ -92,7 +92,7 @@ Rules:
    - If missing, null.
 7) priority:
    - If not given, infer: urgent deadlines -> High, otherwise Medium; trivial -> Low.
-
+8) Be aware of today's date and time. So, if only time is mentioned, the event should be scheduled for anytime after right now.
 CRITICAL OUTPUT RULES:
 - Output MUST be a single JSON array of task objects. No nesting. No extra wrapper keys.
 - Never output empty objects {}.
