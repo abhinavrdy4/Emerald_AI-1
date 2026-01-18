@@ -34,8 +34,8 @@ class ScheduleRequest(BaseModel):
     existing_events: List[Dict[str, Any]] = Field(default_factory=list)
 
     timezone: str = TZ_NAME_DEFAULT
-    work_start: str = "09:00"
-    work_end: str = "18:00"
+    work_start: str = "07:00"
+    work_end: str = "23:00"
     lunch_start: str = "13:00"
     lunch_end: str = "14:00"
     break_minutes: int = 10
@@ -563,7 +563,7 @@ def schedule_tasks(
 
 def gemini_explain(tasks: List[TaskIn], decisions: List[Dict[str, Any]], tz_name: str) -> str:
     if gemini_client is None:
-        lines = ["Scheduled tasks without conflicts, respecting work hours, lunch, breaks, and deadlines when possible."]
+        lines = ["Scheduled tasks without conflicts, respecting work hours, lunch, breaks, and deadlines when possible. If a task is asked for a preferred time, schedule at that time if there isn't a conflict with existing events."]
         for d in decisions:
             lines.append(f"- {d['task']}: {d['note']} ({d['scheduled_start']} → {d['scheduled_end']})")
         return "\n".join(lines)
