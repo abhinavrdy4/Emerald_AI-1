@@ -98,7 +98,7 @@ Rules:
 8) Be aware of today's date and time which is{now}. So, if only time is mentioned, the event should be scheduled for anytime after right now.
 CRITICAL OUTPUT RULES:
 - Output MUST be a single JSON array of task objects. No nesting. No extra wrapper keys.
-- Never output empty objects {}.
+- Never output empty objects {{}}.
 - Keys MUST be exactly: "Title", "deadline", "effort", "priority", "additional details".
 - Deduplicate tasks by Title (case-insensitive). If duplicates occur, merge them into ONE task:
   - Prefer values that are not null/empty.
