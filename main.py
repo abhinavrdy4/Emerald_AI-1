@@ -13,7 +13,10 @@ from pydantic import BaseModel
 from google import genai  # pip install google-genai
 
 # -------------------- Startup --------------------
+from datetime import datetime
 
+# Get current date and time
+now = datetime.now()
 load_dotenv()
 
 app = FastAPI(title="Task Updater API (Gemini)", version="2.0.0")
@@ -31,7 +34,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 client = genai.Client() if GEMINI_API_KEY else None
 
 # Choose a fast model for extraction. Change if needed.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3-flash"
 
 # -------------------- API Contracts --------------------
 
@@ -58,7 +61,7 @@ TASKS_JSON_SCHEMA = {
     },
 }
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = f"""
 You are a task state manager.
 
 Input:
@@ -92,7 +95,7 @@ Rules:
    - If missing, null.
 7) priority:
    - If not given, infer: urgent deadlines -> High, otherwise Medium; trivial -> Low.
-8) Be aware of today's date and time. So, if only time is mentioned, the event should be scheduled for anytime after right now.
+8) Be aware of today's date and time which is{now}. So, if only time is mentioned, the event should be scheduled for anytime after right now.
 CRITICAL OUTPUT RULES:
 - Output MUST be a single JSON array of task objects. No nesting. No extra wrapper keys.
 - Never output empty objects {}.
