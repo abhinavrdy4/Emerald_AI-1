@@ -55,11 +55,13 @@ TASKS_JSON_SCHEMA = {
             "deadline": {"type": ["string", "null"]},
             "effort": {"type": ["integer", "null"], "minimum": 1},
             "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
+            "dependencies": {"type": "array", "items": {"type": "string"}},
             "additional details": {"type": "string"},
         },
-        "required": ["Title", "deadline", "effort", "priority", "additional details"],
+        "required": ["Title", "deadline", "effort", "priority", "dependencies", "additional details"],
     },
 }
+
 
 SYSTEM_PROMPT = f"""
 You are a task state manager.
@@ -87,11 +89,11 @@ Rules:
    for example, if user give directive to change playing tennis deadline tomorrow 6am by 1 week, the deadline should get updated by tomorrow's date + 7 days.
    - If ambiguous, pick the closest match and mention ambiguity in "additional details".
 4) Dependencies:
-   - Write dependencies inside "additional details" using:
-     "Depends on: <Title1>, <Title2>"
+   - Put dependencies in a separate field "dependencies" as an array of Titles.
    - Example:
      directive: "Email mentor after Finish PPT"
-     => Email mentor.additional details MUST include "Depends on: Finish PPT"
+     => Email mentor.dependencies MUST include ["Finish PPT"]
+   - Do NOT write dependency info as "Depends on: ..." inside "additional details".
 5) deadline:
    - If only a date is mentioned, use YYYY-MM-DD.
    - If time is mentioned, use ISO 8601 string (include timezone if available).
@@ -105,7 +107,7 @@ Rules:
 CRITICAL OUTPUT RULES:
 - Output MUST be a single JSON array of task objects. No nesting. No extra wrapper keys.
 - Never output empty objects {{}}.
-- Keys MUST be exactly: "Title", "deadline", "effort", "priority", "additional details".
+- Keys MUST be exactly: "Title", "deadline", "effort", "priority", "dependencies", "additional details".
 - Deduplicate tasks by Title (case-insensitive). If duplicates occur, merge them into ONE task:
   - Prefer values that are not null/empty.
   - If priorities differ, choose the higher urgency: High > Medium > Low.
@@ -135,6 +137,10 @@ def _coerce_task_keys(t: Dict[str, Any]) -> Dict[str, Any]:
         "deadline": "deadline",
         "effort": "effort",
         "priority": "priority",
+        "dependencies": "dependencies",
+        "dependency": "dependencies",
+        "depends_on": "dependencies",
+        "depends on": "dependencies",
         "additional_details": "additional details",
         "additional detail": "additional details",
         "additional details": "additional details",
@@ -149,14 +155,29 @@ def _coerce_task_keys(t: Dict[str, Any]) -> Dict[str, Any]:
 def _merge_task(a: dict, b: dict) -> dict:
     out = dict(a)
 
-    # Prefer non-empty values
     out["deadline"] = out.get("deadline") or b.get("deadline")
     out["effort"] = out.get("effort") or b.get("effort")
 
-    # Priority: take higher
     pa = out.get("priority") or "Medium"
     pb = b.get("priority") or "Medium"
     out["priority"] = pb if PRIORITY_RANK.get(pb, 0) > PRIORITY_RANK.get(pa, 0) else pa
+
+    # Merge dependencies (union, stable order)
+    da = out.get("dependencies") or []
+    db = b.get("dependencies") or []
+    merged = []
+    seen = set()
+    for d in (da + db):
+        if not isinstance(d, str):
+            d = str(d)
+        d = d.strip()
+        if not d:
+            continue
+        kd = d.lower()
+        if kd not in seen:
+            seen.add(kd)
+            merged.append(d)
+    out["dependencies"] = merged
 
     # Merge additional details (avoid duplicates)
     ad = (out.get("additional details") or "").strip()
@@ -193,8 +214,48 @@ def clean_and_dedupe(tasks: Any) -> List[Dict[str, Any]]:
         pr = t.get("priority", "Medium")
         t["priority"] = pr if pr in PRIORITY_RANK else "Medium"
 
+        # --- additional details (string) ---
         ad = t.get("additional details", "")
-        t["additional details"] = ad if isinstance(ad, str) else ""
+        ad = ad if isinstance(ad, str) else ""
+
+        # --- dependencies: ensure list[str], default [] ---
+        deps = t.get("dependencies", [])
+        if deps is None:
+            deps = []
+        if isinstance(deps, str):
+            # allow "A, B" defensively
+            deps = [x.strip() for x in deps.split(",") if x.strip()]
+        if isinstance(deps, list):
+            deps = [str(d).strip() for d in deps if str(d).strip()]
+        else:
+            deps = []
+
+        # --- migrate legacy "Depends on: ..." from additional details into dependencies ---
+        # and REMOVE it from additional details (so you never store it there).
+        m = re.search(r"(?:^|[;\n]\s*)Depends on:\s*(.+)$", ad, flags=re.IGNORECASE)
+        if m:
+            extra = [x.strip() for x in m.group(1).split(",") if x.strip()]
+            deps.extend(extra)
+
+            # remove the Depends on clause completely
+            ad = re.sub(
+                r"(?:^|[;\n]\s*)Depends on:\s*.+$",
+                "",
+                ad,
+                flags=re.IGNORECASE
+            ).strip(" ;\n\t")
+
+        # de-dupe dependencies (case-insensitive) while preserving order
+        seen = set()
+        deps2 = []
+        for d in deps:
+            kd = d.lower()
+            if kd not in seen:
+                seen.add(kd)
+                deps2.append(d)
+
+        t["dependencies"] = deps2
+        t["additional details"] = ad
 
         cleaned.append(t)
 
@@ -271,7 +332,7 @@ def select_relevant_tasks(existing_tasks: List[Dict[str, Any]], directive: str, 
     scored = []
     directive_l = directive.lower()
     for t in existing_tasks:
-        hay = f"{t.get('Title','')} {t.get('additional details','')}".lower()
+        hay = f"{t.get('Title','')} {t.get('additional details','')} {' '.join(t.get('dependencies') or [])}".lower()
         hay_words = set(re.findall(r"[a-z0-9]+", hay))
         score = len(words & hay_words)
         if t.get("Title") and t["Title"].lower() in directive_l:
@@ -305,10 +366,6 @@ def _best_title_match(fragment: str, titles: List[str]) -> Optional[str]:
     return None
 
 def patch_dependencies(tasks: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
-    """
-    Safety net: if user writes "A after B" or "A depends on B", ensure additional details includes it.
-    Runs on each directive.
-    """
     titles = [t["Title"] for t in tasks if t.get("Title")]
     if not titles:
         return tasks
@@ -334,11 +391,13 @@ def patch_dependencies(tasks: List[Dict[str, Any]], text: str) -> List[Dict[str,
         b_title = _best_title_match(b_frag, titles) or b_frag
 
         for t in tasks:
-            if t["Title"] == a_title:
-                dep_str = f"Depends on: {b_title}"
-                ad = t.get("additional details", "")
-                if dep_str not in ad:
-                    t["additional details"] = (ad + ("; " if ad else "") + dep_str)
+            if t.get("Title") == a_title:
+                deps = t.get("dependencies") or []
+                if isinstance(deps, str):
+                    deps = [x.strip() for x in deps.split(",") if x.strip()]
+                if b_title and all(b_title.lower() != x.lower() for x in deps):
+                    deps.append(b_title)
+                t["dependencies"] = deps
 
     return tasks
 
