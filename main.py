@@ -1,43 +1,46 @@
+# main.py
 import json
 import os
 import re
-from typing import Any, Dict, List, Union
+import time
+from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from google import genai  # google-genai SDK  :contentReference[oaicite:4]{index=4}
+from google import genai  # pip install google-genai
 
-# Load .env once at startup (local dev)
+# -------------------- Startup --------------------
+
 load_dotenv()
 
-app = FastAPI(title="Task Updater API", version="1.0.0")
+app = FastAPI(title="Task Updater API (Gemini)", version="2.0.0")
 
-# CORS (tighten allow_origins in production)
+# CORS (tighten in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict in prod
+    allow_origins=["*"],  # TODO: set to your frontend domain(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Gemini API key handling:
-# SDK auto-picks up GEMINI_API_KEY or GOOGLE_API_KEY from env :contentReference[oaicite:5]{index=5}
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 client = genai.Client() if GEMINI_API_KEY else None
 
+# Choose a fast model for extraction. Change if needed.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
 
-# ----------- Request schema -----------
+# -------------------- API Contracts --------------------
 
 class UpdateReq(BaseModel):
     user_input: str
-    tasks: list
+    tasks: list  # existing tasks array
 
 
-# ----------- Structured output schema (Gemini expects pure JSON schema) -----------
+# -------------------- JSON Schema (strict) --------------------
 
 TASKS_JSON_SCHEMA = {
     "type": "array",
@@ -59,28 +62,33 @@ SYSTEM_PROMPT = """
 You are a task state manager.
 
 Input:
-- existing_tasks: JSON array of tasks (may be empty)
-- user_input: natural language that may add multiple tasks, specify dependencies, or edit existing tasks.
+- existing_tasks: JSON array of tasks (subset of tasks that might be relevant)
+- user_input: one directive in natural language (may add OR edit tasks and may imply dependencies)
 
 Output:
-Return the COMPLETE, UPDATED JSON array of tasks.
+Return the UPDATED tasks as a JSON array of task objects.
 
 Rules:
-1) PRESERVE STATE: The output array MUST include ALL tasks from 'existing_tasks' that were not modified,
-   PLUS any new or updated tasks. Do not drop existing tasks unless the user explicitly asks to delete them.
-2) Split multiple tasks into separate entries.
-3) If the user edits an existing task, update it by matching Title (case-insensitive).
-   If ambiguous, choose the closest match and mention ambiguity in "additional details".
-4) Put dependencies in "additional details" using: "Depends on: <Title1>, <Title2>".
-   Example:
-   user_input: "Email mentor after Finish PPT"
-   => Email mentor.additional details MUST include "Depends on: Finish PPT"
+1) PRESERVE STATE INSIDE THIS SUBSET:
+   - Return ALL tasks you received in existing_tasks unless the directive explicitly deletes them.
+   - Apply edits to matching tasks in this subset.
+   - Add new tasks if the directive adds them.
+2) Split multiple tasks in the directive into separate entries.
+3) Editing:
+   - If the directive changes an existing task, match by Title (case-insensitive).
+   - If ambiguous, pick the closest match and mention ambiguity in "additional details".
+4) Dependencies:
+   - Write dependencies inside "additional details" using:
+     "Depends on: <Title1>, <Title2>"
+   - Example:
+     directive: "Email mentor after Finish PPT"
+     => Email mentor.additional details MUST include "Depends on: Finish PPT"
 5) deadline:
    - If only a date is mentioned, use YYYY-MM-DD.
    - If time is mentioned, use ISO 8601 string (include timezone if available).
    - If missing, null.
 6) effort:
-   - Convert hours/minutes to integer minutes if possible (e.g., 1.5h -> 90).
+   - Convert hours/minutes to integer minutes (e.g., 1.5h -> 90).
    - If missing, null.
 7) priority:
    - If not given, infer: urgent deadlines -> High, otherwise Medium; trivial -> Low.
@@ -94,12 +102,13 @@ CRITICAL OUTPUT RULES:
   - If priorities differ, choose the higher urgency: High > Medium > Low.
 """.strip()
 
-PRIORITY_RANK = {"High": 3, "Medium": 2, "Low": 1}
 
+# -------------------- Helpers: cleaning / dedupe / merge --------------------
+
+PRIORITY_RANK = {"High": 3, "Medium": 2, "Low": 1}
 
 def _norm_title(t: str) -> str:
     return " ".join(t.strip().lower().split())
-
 
 def _flatten_list(x: Any) -> List[Any]:
     out: List[Any] = []
@@ -110,9 +119,7 @@ def _flatten_list(x: Any) -> List[Any]:
         out.append(x)
     return out
 
-
 def _coerce_task_keys(t: Dict[str, Any]) -> Dict[str, Any]:
-    # If the model ever returns different keys, normalize them here
     key_map = {
         "title": "Title",
         "Title": "Title",
@@ -130,20 +137,19 @@ def _coerce_task_keys(t: Dict[str, Any]) -> Dict[str, Any]:
             out[kk] = v
     return out
 
-
 def _merge_task(a: dict, b: dict) -> dict:
     out = dict(a)
 
+    # Prefer non-empty values
     out["deadline"] = out.get("deadline") or b.get("deadline")
     out["effort"] = out.get("effort") or b.get("effort")
 
+    # Priority: take higher
     pa = out.get("priority") or "Medium"
     pb = b.get("priority") or "Medium"
-    if PRIORITY_RANK.get(pb, 0) > PRIORITY_RANK.get(pa, 0):
-        out["priority"] = pb
-    else:
-        out["priority"] = pa
+    out["priority"] = pb if PRIORITY_RANK.get(pb, 0) > PRIORITY_RANK.get(pa, 0) else pa
 
+    # Merge additional details (avoid duplicates)
     ad = (out.get("additional details") or "").strip()
     bd = (b.get("additional details") or "").strip()
     if bd and bd not in ad:
@@ -151,74 +157,161 @@ def _merge_task(a: dict, b: dict) -> dict:
     else:
         out["additional details"] = ad
 
-    out["Title"] = out.get("Title") or b.get("Title") or ""
+    out["Title"] = (out.get("Title") or b.get("Title") or "").strip()
     return out
-
 
 def clean_and_dedupe(tasks: Any) -> List[Dict[str, Any]]:
     flat = _flatten_list(tasks)
-
     cleaned: List[Dict[str, Any]] = []
+
     for item in flat:
         if not isinstance(item, dict):
             continue
+        if "Title" not in item and "title" not in item:
+            continue
 
-        if "Title" in item or "title" in item:
-            t = _coerce_task_keys(item)
-            title = t.get("Title")
-            if not isinstance(title, str) or not title.strip():
-                continue
+        t = _coerce_task_keys(item)
+        title = t.get("Title")
+        if not isinstance(title, str) or not title.strip():
+            continue
 
-            t["Title"] = title.strip()
-            t["deadline"] = t.get("deadline", None)
+        t["Title"] = title.strip()
+        t["deadline"] = t.get("deadline", None)
 
-            effort = t.get("effort", None)
-            if isinstance(effort, int) and effort > 0:
-                t["effort"] = effort
-            else:
-                t["effort"] = None
+        effort = t.get("effort", None)
+        t["effort"] = effort if isinstance(effort, int) and effort > 0 else None
 
-            pr = t.get("priority", "Medium")
-            if pr not in PRIORITY_RANK:
-                pr = "Medium"
-            t["priority"] = pr
+        pr = t.get("priority", "Medium")
+        t["priority"] = pr if pr in PRIORITY_RANK else "Medium"
 
-            ad = t.get("additional details", "")
-            t["additional details"] = ad if isinstance(ad, str) else ""
+        ad = t.get("additional details", "")
+        t["additional details"] = ad if isinstance(ad, str) else ""
 
-            cleaned.append(t)
+        cleaned.append(t)
 
     by_title: Dict[str, Dict[str, Any]] = {}
     for t in cleaned:
         k = _norm_title(t["Title"])
-        if k in by_title:
-            by_title[k] = _merge_task(by_title[k], t)
-        else:
-            by_title[k] = t
+        by_title[k] = _merge_task(by_title[k], t) if k in by_title else t
 
     return list(by_title.values())
 
+def merge_into_global(global_tasks: List[Dict[str, Any]], partial: Any) -> List[Dict[str, Any]]:
+    partial_clean = clean_and_dedupe(partial)
+    combined = global_tasks + partial_clean
+    return clean_and_dedupe(combined)
 
-def _best_title_match(fragment: str, titles: List[str]) -> Union[str, None]:
+
+# -------------------- Helpers: directive split + candidate selection --------------------
+
+def split_directives(user_input: str) -> List[str]:
+    """
+    Splits a big user input into smaller directives.
+    This keeps each Gemini call small & consistent.
+    """
+    user_input = user_input.strip()
+    if not user_input:
+        return []
+
+    # Split by lines/bullets first
+    lines: List[str] = []
+    for line in user_input.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Remove common bullet markers
+        line = re.sub(r"^\s*[-*•]\s*", "", line).strip()
+        if line:
+            lines.append(line)
+
+    if not lines:
+        lines = [user_input]
+
+    # Split each line by sentence-ish separators
+    parts: List[str] = []
+    for line in lines:
+        chunks = re.split(r"\s*(?:\.\s+|;\s+)\s*", line)
+        for c in chunks:
+            c = c.strip(" ,")
+            if c:
+                parts.append(c)
+
+    # Second pass for long parts: split by connectors
+    final: List[str] = []
+    for p in parts:
+        if len(p) > 140:
+            more = re.split(r"\b(?:also|then|and then|next)\b", p, flags=re.IGNORECASE)
+            final.extend([m.strip(" ,") for m in more if m.strip(" ,")])
+        else:
+            final.append(p)
+
+    return [f for f in final if f]
+
+def select_relevant_tasks(existing_tasks: List[Dict[str, Any]], directive: str, k: int = 8) -> List[Dict[str, Any]]:
+    """
+    Select top-k tasks most relevant to this directive (Title/details overlap).
+    This prevents prompt growth as task list becomes large.
+    """
+    if not existing_tasks:
+        return []
+
+    words = set(re.findall(r"[a-z0-9]+", directive.lower()))
+    if not words:
+        return existing_tasks[:k]
+
+    scored = []
+    directive_l = directive.lower()
+    for t in existing_tasks:
+        hay = f"{t.get('Title','')} {t.get('additional details','')}".lower()
+        hay_words = set(re.findall(r"[a-z0-9]+", hay))
+        score = len(words & hay_words)
+        if t.get("Title") and t["Title"].lower() in directive_l:
+            score += 5
+        scored.append((score, t))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [t for s, t in scored[:k]]
+
+    # If all scores are 0, still return a small slice (avoid sending everything)
+    if top and all(s == 0 for s, _ in scored[:k]):
+        return existing_tasks[:k]
+
+    return top
+
+
+# -------------------- Helpers: dependency patch safety net --------------------
+
+def _best_title_match(fragment: str, titles: List[str]) -> Optional[str]:
     frag = fragment.strip().lower()
     if not frag:
         return None
+    # exact
     for tt in titles:
         if frag == tt.lower():
             return tt
+    # substring
     for tt in titles:
         if frag in tt.lower():
             return tt
     return None
 
-
-def patch_dependencies(tasks: List[Dict[str, Any]], user_input: str) -> List[Dict[str, Any]]:
+def patch_dependencies(tasks: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """
+    Safety net: if user writes "A after B" or "A depends on B", ensure additional details includes it.
+    Runs on each directive.
+    """
     titles = [t["Title"] for t in tasks if t.get("Title")]
+    if not titles:
+        return tasks
 
-    segments = re.split(r"[.\n;]+", user_input)
+    segments = re.split(r"[.\n;]+", text)
     pairs = []
 
     for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+
         m = re.search(r"(.+?)\s+after\s+(.+?)(?:,|$)", seg, flags=re.IGNORECASE)
         if m:
             pairs.append((m.group(1).strip(), m.group(2).strip()))
@@ -241,14 +334,12 @@ def patch_dependencies(tasks: List[Dict[str, Any]], user_input: str) -> List[Dic
     return tasks
 
 
-# ----------- Gemini call -----------
+# -------------------- Gemini call (structured outputs) --------------------
 
-def gemini_update(existing_tasks, user_input) -> str:
+def gemini_update_subset(existing_tasks_subset: List[Dict[str, Any]], directive: str) -> str:
     """
-    Uses Gemini structured outputs:
-    config.response_mime_type = application/json
-    config.response_json_schema = <JSON schema>
-    :contentReference[oaicite:6]{index=6}
+    Gemini call for ONE directive + small subset of tasks.
+    Returns JSON text (array of task objects).
     """
     if client is None:
         raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY not configured")
@@ -256,81 +347,79 @@ def gemini_update(existing_tasks, user_input) -> str:
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         "existing_tasks:\n"
-        f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
+        f"{json.dumps(existing_tasks_subset, ensure_ascii=False)}\n\n"
         "user_input:\n"
-        f"{user_input}"
+        f"{directive}"
     )
 
-    resp = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": TASKS_JSON_SCHEMA,
-        },
-    )
-    return resp.text
+    # Simple retry for transient errors (rate limits etc.)
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={
+                    "temperature": 0.2,
+                    "response_mime_type": "application/json",
+                    "response_json_schema": TASKS_JSON_SCHEMA,
+                },
+            )
+            return resp.text
+        except Exception as e:
+            last_err = e
+            time.sleep(0.6 * (attempt + 1))
+
+    raise last_err
 
 
-def gemini_update_fallback(existing_tasks, user_input) -> str:
-    """
-    Fallback: still request JSON mime type, but no schema.
-    """
-    if client is None:
-        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY not configured")
-
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        "Return valid JSON only.\n\n"
-        "existing_tasks:\n"
-        f"{json.dumps(existing_tasks, ensure_ascii=False)}\n\n"
-        "user_input:\n"
-        f"{user_input}"
-    )
-
-    resp = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
-    )
-    return resp.text
-
-
-# ----------- Routes -----------
+# -------------------- Routes --------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True, "has_key": bool(GEMINI_API_KEY)}
-
+    return {
+        "ok": True,
+        "has_key": bool(GEMINI_API_KEY),
+        "model": GEMINI_MODEL,
+    }
 
 @app.post("/tasks/update")
 def update_tasks(req: UpdateReq):
+    """
+    POST /tasks/update
+    Body: { "user_input": "...", "tasks": [...] }
+    Returns: { "tasks": [...] }
+
+    Scalable approach:
+    - Split input into directives
+    - For each directive: pick top-k relevant tasks and call Gemini on only that subset
+    - Merge back into global state deterministically
+    """
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="Server misconfigured: GEMINI_API_KEY/GOOGLE_API_KEY missing")
 
-    # 1) Structured outputs path
-    try:
-        raw = gemini_update(req.tasks, req.user_input)
-        parsed = json.loads(raw)
-        updated = clean_and_dedupe(parsed)
-        updated = patch_dependencies(updated, req.user_input)
-        updated = clean_and_dedupe(updated)
-        return {"tasks": updated}
-    except Exception:
-        pass
+    directives = split_directives(req.user_input)
+    if not directives:
+        return {"tasks": clean_and_dedupe(req.tasks)}
 
-    # 2) Fallback path
-    try:
-        raw = gemini_update_fallback(req.tasks, req.user_input)
-        parsed = json.loads(raw)
+    global_tasks = clean_and_dedupe(req.tasks)
 
-        # In case model wraps unexpectedly
-        if isinstance(parsed, dict) and "tasks" in parsed:
-            parsed = parsed["tasks"]
+    for directive in directives:
+        subset = select_relevant_tasks(global_tasks, directive, k=8)
 
-        updated = clean_and_dedupe(parsed)
-        updated = patch_dependencies(updated, req.user_input)
-        updated = clean_and_dedupe(updated)
-        return {"tasks": updated}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to produce valid tasks JSON: {str(e)}")
+        # If subset is empty and directive looks like "add", still send empty subset.
+        raw = gemini_update_subset(subset, directive)
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # If something went wrong, fail loudly (better than corrupting state)
+            raise HTTPException(status_code=400, detail=f"Gemini returned invalid JSON for directive: {directive}")
+
+        # Merge model output into global list deterministically
+        global_tasks = merge_into_global(global_tasks, parsed)
+
+        # Patch dependencies (safety net) and clean again
+        global_tasks = patch_dependencies(global_tasks, directive)
+        global_tasks = clean_and_dedupe(global_tasks)
+
+    return {"tasks": global_tasks}
