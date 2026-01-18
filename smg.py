@@ -423,7 +423,7 @@ def gemini_explain(tasks: List[TaskIn], decisions: List[Dict[str, Any]], tz_name
 
 # -------------------- Endpoint --------------------
 
-@app.post("/schedule/plan", response_model=ScheduleResponse)
+@router.post("/schedule/plan", response_model=ScheduleResponse)
 def plan_schedule(req: ScheduleRequest):
     try:
         planned_events, decisions = schedule_tasks(
@@ -443,6 +443,6 @@ def plan_schedule(req: ScheduleRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/health")
+@router.get("/health")
 def health():
     return {"ok": True, "has_gemini_key": bool(GEMINI_API_KEY)}
