@@ -98,7 +98,6 @@ Rules:
 4.5) If a time is mentioned at which task has to be completed, mention it in additional Details as "Time:....."(in ISO 8601 string)
 5) deadline:
    - If only a date is mentioned, use YYYY-MM-DD.
-   - If time is mentioned for deadline specifiacaly, use ISO 8601 string (include timezone if available).
    - If missing, null.
 6) effort:
    - Convert hours/minutes to integer minutes (e.g., 1.5h -> 90).
