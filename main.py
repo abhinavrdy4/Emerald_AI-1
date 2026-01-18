@@ -78,7 +78,8 @@ Rules:
    - Add new tasks if the directive adds them.
 2) Split multiple tasks in the directive into separate entries.
 3) Editing:
-   - If the directive changes an existing task, match by Title (case-insensitive).
+   - If the directive changes an existing task, match by Title (case-insensitive) and modify those contents.
+   for example, if user give directive to change playing tennis deadline tomorrow 6am by 1 week, the deadline should get updated by tomorrow's date + 7 days.
    - If ambiguous, pick the closest match and mention ambiguity in "additional details".
 4) Dependencies:
    - Write dependencies inside "additional details" using:
