@@ -575,7 +575,7 @@ def gemini_explain(tasks: List[TaskIn], decisions: List[Dict[str, Any]], tz_name
     }
 
     resp = gemini_client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-3-pro-preview",
         contents=(
             "Explain scheduling decisions clearly for the user.\n"
             "Mention when you honored preferred times from additional details.\n"
